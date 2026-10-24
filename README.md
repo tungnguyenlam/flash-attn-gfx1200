@@ -1,6 +1,6 @@
 # FlashAttention-2 for AMD RDNA4 (gfx1200)
 
-Prebuilt [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) wheels for the
+Prebuilt [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) wheel for the
 **AMD Radeon RX 9060 XT 16 GB (gfx1200)**, built with the Composable Kernel (CK) backend.
 
 Upstream publishes CUDA wheels only. On ROCm, `pip install flash-attn` compiles ~1,800 CK
@@ -13,13 +13,15 @@ wheel so other gfx1200 owners can just install it.
 
 ## Install
 
-Download the wheel from the [latest release](../../releases/latest), then:
-
 ```bash
-python -m pip install --no-deps flash_attn-2.8.4+rocm71torch2.13cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+python -m pip install --no-deps \
+  https://github.com/tungnguyenlam/flash-attn-gfx1200/releases/latest/download/flash_attn-2.8.4-cp312-cp312-linux_x86_64.whl
+python -m pip install einops
 ```
 
-Use `--no-deps` so pip cannot replace your ROCm PyTorch with a CUDA build from PyPI.
+`--no-deps` keeps pip from replacing your ROCm PyTorch with a CUDA build from PyPI.
+`einops` is flash-attn's only other runtime dependency (used by `flash_attn.bert_padding`,
+which Transformers imports).
 
 Verify:
 
@@ -45,6 +47,7 @@ with a different PyTorch minor version or Python version.
 | C++ ABI | `cxx11abiTRUE` |
 | Wheel tag | `cp312-cp312-linux_x86_64` |
 | Backend | CK (`FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE`) |
+| Wheel size | 41 MB (188 MB extension, gfx1200 kernels only) |
 
 ## Use with Transformers
 
@@ -73,13 +76,55 @@ That is the zero-install option. This wheel exists for code that explicitly requ
 `flash_attn` package (Transformers' `flash_attention_2`, vLLM, ComfyUI, custom kernels, ...),
 and for a native CK implementation on RDNA4.
 
+## Results
+
+All measurements on the RX 9060 XT 16 GB, bf16, `B=1`, `H=16`, `KV=8`, `D=64`, causal.
+`verify.py`, 30 timed iterations after 10 warmup.
+
+### Against PyTorch's math fallback
+
+| seq | FA fwd | SDPA math fwd | speedup | FA fwd+bwd | SDPA math fwd+bwd | speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 0.034 ms | 1.667 ms | 49.1x | 0.859 ms | 3.721 ms | 4.3x |
+| 2048 | 0.234 ms | 21.895 ms | 93.8x | 10.510 ms | 49.170 ms | 4.7x |
+| 4096 | 0.780 ms | 86.670 ms | 111.2x | 41.070 ms | 261.147 ms | 6.4x |
+
+### Against PyTorch's AOTriton flash backend
+
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python verify.py`
+
+| seq | FA fwd | SDPA AOTriton fwd | speedup | FA fwd+bwd | SDPA AOTriton fwd+bwd | FA relative |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 0.034 ms | 0.082 ms | 2.4x | 0.893 ms | 0.308 ms | 2.9x slower |
+| 2048 | 0.295 ms | 0.783 ms | 2.7x | 10.643 ms | 1.690 ms | 6.3x slower |
+| 4096 | 0.787 ms | 1.802 ms | 2.3x | 41.371 ms | 5.860 ms | 7.1x slower |
+
+**Read this before using it for training.** The CK forward kernel is consistently faster
+(2.3–2.7x) than PyTorch's AOTriton kernel on gfx1200, and uses far less memory than the math
+fallback. But CK's **backward** kernel is currently much slower than AOTriton on this GPU.
+For training, PyTorch SDPA with `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` is the better
+choice unless you specifically need the `flash_attn` API. For inference, this wheel is the
+faster option.
+
+### End-to-end LFM2.5-350M step
+
+`bench_lfm2.py`, batch 4, seq 512, fwd+bwd, 5 timed steps after 2 warmup. This model is
+hybrid conv/attention, and `causal_conv1d` falls back to PyTorch on ROCm, so attention is
+only part of the step:
+
+| attention backend | ms/step | peak GiB |
+|---|---:|---:|
+| SDPA math | 300.8 | 5.08 |
+| SDPA AOTriton | 242.9 | 4.61 |
+| flash-attn CK | 254.1 | 4.61 |
+
 ## Build from source
 
-Requirements: ROCm torch, ROCm development headers (`/opt/rocm/include`), `gfx1200` visible
-to PyTorch, ~30 GB disk, and enough RAM for the parallel compile.
+Requirements: ROCm PyTorch, ROCm development headers (`/opt/rocm/include`), `gfx1200`
+visible to PyTorch, ~30 GB disk, and enough RAM for the parallel compile.
 
 ```bash
-git clone https://github.com/<user>/flash-attn-gfx1200.git
+git clone https://github.com/tungnguyenlam/flash-attn-gfx1200.git
 cd flash-attn-gfx1200
 ./build.sh                     # MAX_JOBS=6 by default
 ```
@@ -94,30 +139,20 @@ FLASH_ATTENTION_SKIP_CK_BUILD=FALSE
 GPU_ARCHS=gfx1200
 ```
 
-On an i5-14600K with `MAX_JOBS=6`, the build takes about **X hours** and produces a
-**Y GB** wheel from 1,837 generated CK kernels. `MAX_JOBS=1` is much slower but uses less
-memory.
+The published wheel was built with `MAX_JOBS=2` on an i5-14600K and took about **4 hours**
+(1,837 generated CK kernels). `MAX_JOBS=6` is roughly 2–3x faster if the CPU has the
+cooling and RAM headroom. `MAX_JOBS=1` is slow but very gentle on the machine.
 
 ## Limitations
 
-- **gfx1200 only.** The binary contains kernels for `gfx1200`; `GPU_ARCHS=gfx1201 ./build.sh`
-  produces a different wheel for RX 9070-class cards.
+- **gfx1200 only.** The binary contains kernels for `gfx1200`; use
+  `GPU_ARCHS=gfx1201 ./build.sh` for RX 9070-class cards.
 - **Exact ABI.** Rebuild after changing Python, PyTorch, or the C++ ABI.
+- **CK backward is slower than AOTriton on gfx1200** (see Results).
 - **No sliding-window attention in the CK backend** (upstream limitation). Full causal and
   non-causal attention, GQA/MQA, varlen, dropout, and head dims up to 256 are supported.
 - CK on RDNA4 is not an officially supported configuration. Correctness was checked against
   fp32 SDPA; see `verify.py`.
-
-## Results
-
-Measured with `verify.py` on the RX 9060 XT (bf16, `B=1`, `H=16`, `KV=8`, `D=64`, causal).
-SDPA baseline is PyTorch's math backend:
-
-| seq len | FA fwd | SDPA fwd | FA fwd+bwd | SDPA fwd+bwd |
-|---:|---:|---:|---:|---:|
-| 512 | TBD | TBD | TBD | TBD |
-| 2048 | TBD | TBD | TBD | TBD |
-| 8192 | TBD | TBD | TBD | TBD |
 
 ## License
 

@@ -5,6 +5,11 @@ Compares flash_attn_func (CK backend) against PyTorch's math SDPA reference for
 a LFM2-shaped GQA workload, then benchmarks forward/backward.
 
     python verify.py
+
+Set TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 to use PyTorch's flash SDPA
+kernel as the benchmark baseline instead of the math fallback:
+
+    TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python verify.py
 """
 import torch
 import torch.nn.functional as F
@@ -100,12 +105,19 @@ def speed(batch, seqlen, nheads, nheads_kv, headdim, dtype=torch.bfloat16):
         q2.grad = k2.grad = v2.grad = None
 
     fa_bwd_ms = bench(fa_step, warmup=5, rep=20)
-    sdpa_bwd_ms = bench(sdpa_step, warmup=5, rep=20)
+    try:
+        sdpa_bwd_ms = bench(sdpa_step, warmup=5, rep=20)
+        bwd_report = f"{sdpa_bwd_ms:.3f} ms ({sdpa_bwd_ms / fa_bwd_ms:.2f}x)"
+    except torch.OutOfMemoryError:
+        # The math fallback materializes the full score matrix; long sequences need
+        # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 or a smaller sequence length.
+        torch.cuda.empty_cache()
+        bwd_report = "OOM (math fallback)"
 
     print(
         f"B={batch} S={seqlen} H={nheads}/{nheads_kv} D={headdim}: "
         f"fwd FA {fa_ms:.3f} ms vs SDPA {sdpa_ms:.3f} ms ({sdpa_ms / fa_ms:.2f}x) | "
-        f"fwd+bwd FA {fa_bwd_ms:.3f} ms vs SDPA {sdpa_bwd_ms:.3f} ms ({sdpa_bwd_ms / fa_bwd_ms:.2f}x)"
+        f"fwd+bwd FA {fa_bwd_ms:.3f} ms vs SDPA {bwd_report}"
     )
 
 
@@ -118,7 +130,7 @@ def main():
     check(2, 1024, 16, 8, 64)
     check(2, 512, 16, 16, 64)
 
-    for seqlen in (512, 2048, 8192):
+    for seqlen in (512, 2048, 4096):
         speed(1, seqlen, 16, 8, 64)
 
 
